@@ -1,0 +1,161 @@
+#CODE FOR MDF
+import numpy as np 
+import matplotlib.pyplot as plt
+
+# Parámetros de difusividad
+D0 = 3            # valor base (ajusta como gustes, debe ser > 0)
+D1 = 2.0 * D0     # impone la razón D1 / D0 = 2
+
+def D(theta):
+    """
+    Difusividad periódica con periodo 2π:
+    D(θ) = D0 + ((1 - cos(θ))/2)^2 * D1
+    donde D1 = 2 * D0.
+    """
+    return D0 + ((1 - np.cos(theta))/2)**2 * D1
+
+def inicial_condition(theta):
+    """
+    Condición inicial en [0,1] y con integral 1 sobre un periodo.
+    ρ0(θ) = 1/(2π) + 0.1 cos(θ).
+    
+    - Integral(ρ0) = 1
+    - ρ0 ∈ [0.059..., 0.259...], ⊂ [0,1].
+    """
+    return 1/(2.0*np.pi) + 0.1 * np.cos(theta)
+
+def solve_adioui_FDM(N=64, dt=1e-4, total_time=1.0, beta=0.0):
+    """
+    Resuelve el modelo de Adioui con:
+      ∂ρ/∂t = ∂²/∂θ²(D(θ)*ρ) - β ∂/∂θ [ ρ(θ)* ( I1(θ) - I2(θ) ) ]
+    usando esquema explícito (Forward Euler) y
+    diferencias finitas para la parte difusiva e integral.
+
+    Parámetros
+    ----------
+    N : int
+        Número de puntos espaciales en θ.
+    dt : float
+        Paso de tiempo.
+    total_time : float
+        Tiempo total de simulación.
+    beta : float
+        Parámetro β en el modelo.
+
+    Retorna
+    -------
+    theta_grid : np.ndarray
+        Malla espacial en θ (en [-π, π]).
+    rho : np.ndarray
+        Solución numérica ρ(t, θ) al final de la simulación.
+    """
+    # Dominio en θ
+    L = 2.0 * np.pi
+    theta_grid = np.linspace(-np.pi, np.pi, N, endpoint=False)
+    h = L / N  # espacio entre puntos
+
+    # Condición inicial
+    rho = inicial_condition(theta_grid)
+
+    # Número de pasos de tiempo
+    num_steps = int(total_time / dt)
+
+    # N/2 (asumiendo N par) para las integrales [θ, θ+π] y [θ-π, θ]
+    half_N = N // 2
+
+    for _ in range(num_steps):
+        rho_old = rho.copy()
+
+        # 1) Término difusivo: q(θ_i) = D(θ_i) * ρ(θ_i)
+        q = D(theta_grid) * rho_old
+        q_plus  = np.roll(q, -1)
+        q_minus = np.roll(q,  1)
+        diffusion_term = (q_plus - 2.0*q + q_minus) / (h**2)
+
+        # 2) Término integral no local
+        I1 = np.zeros_like(rho_old)
+        I2 = np.zeros_like(rho_old)
+
+        for i in range(N):
+            # Intervalo [θ_i, θ_i + π]
+            i_start = i
+            i_end   = (i + half_N) % N
+            if i_start < i_end:
+                idx_range_1 = range(i_start, i_end)
+            else:
+                idx_range_1 = list(range(i_start, N)) + list(range(0, i_end))
+            sum_I1 = np.sum(rho_old[list(idx_range_1)]) * h
+
+            # Intervalo [θ_i - π, θ_i]
+            i_end_2   = i
+            i_start_2 = (i - half_N) % N
+            if i_start_2 < i_end_2:
+                idx_range_2 = range(i_start_2, i_end_2)
+            else:
+                idx_range_2 = list(range(i_start_2, N)) + list(range(0, i_end_2))
+            sum_I2 = np.sum(rho_old[list(idx_range_2)]) * h
+
+            I1[i] = sum_I1
+            I2[i] = sum_I2
+
+        # G(θ_i) = ρ(θ_i) * [I1(θ_i) - I2(θ_i)]
+        G = rho_old * (I1 - I2)
+
+        # Diferencia central de G(θ)
+        G_plus  = np.roll(G, -1)
+        G_minus = np.roll(G,  1)
+        derivative_G = (G_plus - G_minus) / (2.0 * h)
+
+        # Término no local
+        nonlocal_term = -beta * derivative_G
+
+        # 3) Actualización de ρ (Forward Euler)
+        rho_new = rho_old + dt * (diffusion_term + nonlocal_term)
+
+        # Asumimos periodicidad (roll() ya maneja índices)
+        rho = rho_new
+
+    return theta_grid, rho
+
+def main():
+    # Parámetros de simulación
+    N_points = 128       # tamaño de la malla en θ
+    dt = 1e-4            # paso de tiempo
+    total_time = 100.0   # tiempo total de simulación
+    betas = [0, 2, 4, 16, 32]  # distintos valores de β a probar
+
+    # Diccionario para guardar resultados
+    results = {}
+
+    # Ejecutar la simulación para cada β
+    for b in betas:
+        theta_grid, rho_final = solve_adioui_FDM(N=N_points,
+                                                 dt=dt,
+                                                 total_time=total_time,
+                                                 beta=b)
+        results[b] = (theta_grid, rho_final)
+
+    # Graficar
+    plt.figure(figsize=(8,6))
+    for b in betas:
+        theta, rho_f = results[b]
+        plt.plot(theta, rho_f, label=f"β = {b}")
+    plt.title(f"Solución ρ(θ) vs θ después de {total_time} seg.")
+    plt.xlabel("θ")
+    plt.ylabel("ρ(θ)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Imprimir ejemplos en consola
+    print("\n===== Resultados Numéricos Finales =====")
+    for b in betas:
+        _, rho_f = results[b]
+        print(f"β = {b}")
+        print(f"  Mínimo de ρ => {rho_f.min():.5f}")
+        print(f"  Máximo ρ => {rho_f.max():.5f}")
+        print(f"  Integral numérica => {np.sum(rho_f) * (2.0*np.pi/N_points):.5f}")
+        print(f"  Ejemplo de 5 valores => {rho_f[:5]} ...")
+
+if __name__ == "__main__":
+    main()
