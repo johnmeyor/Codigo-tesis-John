@@ -1,0 +1,239 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# -----------------------------------------------------------------------------------
+# 1) Parámetros globales: equivalentes al ejemplo original FDM
+# -----------------------------------------------------------------------------------
+
+D0 = 3.0
+D1 = 2.0 * D0   # razón D1 / D0 = 2
+beta_values = [0, 2, 4, 16, 32]  # distintos valores de beta a probar
+
+# -----------------------------------------------------------------------------------
+# 2) Definición de la difusividad y condición inicial
+# -----------------------------------------------------------------------------------
+def D(theta):
+    """
+    Difusividad periódica con periodo 2π:
+    D(θ) = D0 + ((1 - cos(θ))/2)^2 * D1
+    """
+    return D0 + ((1 - np.cos(theta)) / 2.0)**2 * D1
+
+def rho_inicial(theta):
+    """
+    Condición inicial en [0,1], integral=1.
+    ρ_0(θ) = 1/(2π) + 0.1 cos(θ).
+    """
+    return 1.0/(2.0*np.pi) + 0.1*np.cos(theta)
+
+# -----------------------------------------------------------------------------------
+# 3) Construcción de la malla FEM en θ ∈ [-π, π]
+#    N nodos => N elementos finitos (eliminando el nodo N)
+# -----------------------------------------------------------------------------------
+def create_FEM_mesh(N):
+    """
+    Crea malla uniforme en θ ∈ [-π, π], nodos θ_i.
+    Retorna:
+      theta_nodes: array de nodos (N nodos, no incluyendo θ_N = 2π)
+      elementos: lista de (i, i+1) con indices de nodos
+    """
+    # Genera N puntos en [-π, π], sin incluir el último (endpoint=False).
+    theta_nodes = np.linspace(-np.pi, np.pi, N, endpoint=False)
+
+    # Forma los elementos finitos como pares (i, i+1), ajustando con %N para periodicidad.
+    elementos = [(i, (i+1)%N) for i in range(N)]
+    return theta_nodes, elementos
+
+# -----------------------------------------------------------------------------------
+# 4) Ensamble de matrices: Masa (M) y Rigidez (K) a partir de
+#    funciones base lineales en cada elemento, integrando D(θ).
+# -----------------------------------------------------------------------------------
+def assemble_FEM_matrices(theta_nodes, elementos):
+    """
+    Ensambla la matriz de masa (M) y rigidez (K) para
+    PDE: d/dθ( D(θ) dρ/dθ ).
+    Uso de EF lineales 1D y regla simple (2 puntos).
+    """
+    N = len(theta_nodes)
+    M = np.zeros((N, N))
+    K = np.zeros((N, N))
+
+    for e in elementos:
+        i, j = e   # índices nodales
+        theta_i = theta_nodes[i]
+        theta_j = theta_nodes[j]
+        # Le = longitud del elemento. Se ajusta si sale < 0, sumando 2π.
+        Le = theta_j - theta_i
+        if Le < 0:
+            Le += 2.0 * np.pi
+
+        # Puntos de Gauss locales (2 puntos) y sus pesos para la cuadratura.
+        gauss_points = [-1.0/np.sqrt(3), 1.0/np.sqrt(3)]
+        weights = [1.0, 1.0]
+
+        for gp, w in zip(gauss_points, weights):
+            # Transformación de ξ ([-1,1]) a θ (θ_i, θ_j).
+            theta_loc = theta_i + (gp + 1.0)*0.5*Le
+            dtheta_dxi = Le * 0.5
+
+            # Funciones base lineales en coordenada ξ: psi0, psi1.
+            psi0 = (1.0 - gp)*0.5
+            psi1 = (1.0 + gp)*0.5
+            dpsi0_dxi = -0.5
+            dpsi1_dxi =  0.5
+
+            # Derivadas respecto a θ (dividiendo por dtheta_dxi).
+            dpsi0_dtheta = dpsi0_dxi / dtheta_dxi
+            dpsi1_dtheta = dpsi1_dxi / dtheta_dxi
+
+            # Evaluación de D(θ) en el punto de Gauss.
+            D_val = D(theta_loc)
+
+            # Aporte a la matriz de masa M (EF lineales).
+            # M_ij ~ ∫ ψ_i * ψ_j dθ.
+            M[i, i] += w * psi0*psi0 * dtheta_dxi
+            M[i, j] += w * psi0*psi1 * dtheta_dxi
+            M[j, i] += w * psi1*psi0 * dtheta_dxi
+            M[j, j] += w * psi1*psi1 * dtheta_dxi
+
+            # Aporte a la matriz de rigidez K.
+            # K_ij ~ ∫ D(θ) dψ_i/dθ * dψ_j/dθ dθ.
+            K[i,i] += w * D_val * dpsi0_dtheta * dpsi0_dtheta * dtheta_dxi
+            K[i,j] += w * D_val * dpsi0_dtheta * dpsi1_dtheta * dtheta_dxi
+            K[j,i] += w * D_val * dpsi1_dtheta * dpsi0_dtheta * dtheta_dxi
+            K[j,j] += w * D_val * dpsi1_dtheta * dpsi1_dtheta * dtheta_dxi
+
+    return M, K
+
+# -----------------------------------------------------------------------------------
+# 5) Cálculo del término integral I(t,θ) y su derivada en θ
+# -----------------------------------------------------------------------------------
+def compute_nonlocal_term_FEM(rho_vec, theta_nodes):
+    """
+    Calcula, para cada nodo i, el término no local:
+    I_i = ∫[θ_i, θ_i+π] rho(t,θ') dθ' - ∫[θ_i-π, θ_i] rho(t,θ') dθ'.
+    Luego deriva d/dθ [ rho(θ)* I(θ) ] en nodos i (approx).
+
+    En esta versión, se utiliza sumas discretas con la aproximación puntual en nodos.
+    """
+    N = len(theta_nodes)
+    h_malla = (2.0 * np.pi) / N  # se asume malla uniforme
+    I_vals = np.zeros_like(rho_vec)
+
+    half_N = N // 2
+
+    for i in range(N):
+        # Primera integral: [θ_i, θ_i+π]
+        idx_start_1 = i
+        idx_end_1 = (i + half_N) % N
+        if i + half_N < N:
+            sum_I1 = np.sum(rho_vec[i:i + half_N]) * h_malla
+        else:
+            sum_I1 = np.sum(rho_vec[i:N]) * h_malla + \
+                     np.sum(rho_vec[0:(i + half_N) % N]) * h_malla
+
+        # Segunda integral: [θ_i-π, θ_i]
+        idx_start_2 = (i - half_N) % N
+        idx_end_2 = i
+        if i - half_N >= 0:
+            sum_I2 = np.sum(rho_vec[i - half_N:i]) * h_malla
+        else:
+            sum_I2 = np.sum(rho_vec[0:i]) * h_malla + \
+                     np.sum(rho_vec[idx_start_2:N]) * h_malla
+
+        I_vals[i] = sum_I1 - sum_I2
+
+    # G(θ_i) = ρ(θ_i)*I(θ_i). Luego derivada central de G.
+    G = rho_vec * I_vals
+    G_plus = np.roll(G, -1)
+    G_minus = np.roll(G,  1)
+    derivative_G = (G_plus - G_minus) / (2.0 * h_malla)
+
+    return derivative_G
+
+# -----------------------------------------------------------------------------------
+# 6) Bucle de tiempo: Forward Euler, resolviendo M*(ρ^{n+1}-ρ^n)/dt = ...
+# -----------------------------------------------------------------------------------
+def solve_adioui_FEM(N=64, dt=1e-4, total_time=5.0, beta=0.0):
+    """
+    Resuelve la ecuación de Adioui con FEM en θ y Forward Euler en t.
+    Periodicidad en θ implementada correctamente sin nodos redundantes.
+    """
+    # (6.1) Crear la malla FEM y ensamblar matrices
+    theta_nodes, elems = create_FEM_mesh(N)
+    M, K = assemble_FEM_matrices(theta_nodes, elems)
+
+    # (6.2) Asignar la condición inicial
+    rho_vec = rho_inicial(theta_nodes)
+
+    # (6.3) Calcular número de pasos de tiempo
+    num_steps = int(total_time / dt)
+
+    for step in range(num_steps):
+        rho_old = rho_vec.copy()
+
+        # (A) Término difusivo: -K * rho_old
+        dif_term = -K.dot(rho_old)
+
+        # (B) Término no local
+        derivative_G = compute_nonlocal_term_FEM(rho_old, theta_nodes)
+        nonlocal_term = -beta * derivative_G
+
+        # (C) Ensamble del lado derecho (rhs)
+        # M*(ρ_new - ρ_old)/dt = dif_term + no_local_term
+        rhs = M.dot(rho_old) + dt*(dif_term + nonlocal_term)
+
+        # (D) Resolver M*ρ_new = rhs
+        try:
+            rho_new = np.linalg.solve(M, rhs)
+        except np.linalg.LinAlgError as e:
+            print(f"Error en la resolución del sistema lineal en paso {step}: {e}")
+            return theta_nodes, rho_vec
+
+        # Actualizar la solución
+        rho_vec = rho_new
+
+    return theta_nodes, rho_vec
+
+# -----------------------------------------------------------------------------------
+# 7) Función principal: simular y graficar para betas en [0,2,4,16,32]
+# -----------------------------------------------------------------------------------
+def main():
+    N_points = 64
+    dt = 1e-5
+    total_time = 20  # se puede ajustar a necesidad
+
+    results = {}
+    for b in beta_values:
+        theta_grid, rho_final = solve_adioui_FEM(N=N_points,
+                                                 dt=dt,
+                                                 total_time=total_time,
+                                                 beta=b)
+        results[b] = (theta_grid, rho_final)
+
+    # Graficado de resultados
+    plt.figure(figsize=(10,6))
+    for b in beta_values:
+        theta, rho_f = results[b]
+        plt.plot(theta, rho_f, label=f"β = {b}")
+
+    plt.title(f"Solución FEM ρ(θ) vs θ después de t={total_time}")
+    plt.xlabel("θ")
+    plt.ylabel("ρ(θ)")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Mostrar algunos valores relevantes
+    print("\n=== Resultados Numéricos Finales (FEM) ===")
+    for b in beta_values:
+        _, rho_f = results[b]
+        print(f"β = {b}")
+        print(f"  Mínimo ρ => {rho_f.min():.5f}")
+        print(f"  Máximo ρ => {rho_f.max():.5f}")
+        integral_rho = np.sum(rho_f)*(2.0*np.pi/N_points)
+        print(f"  Integral numérica => {integral_rho:.5f}")
+        print(f"  Ejemplo 5 valores => {rho_f[:5]} ...")
+
+if __name__ == "__main__":
+    main()
